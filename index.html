@@ -1,0 +1,628 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#fafaf8" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="Intake" />
+  <title>Intake — Calorie & Macro Tracker</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body { background: #fafaf8; font-family: 'Inter', system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+    #root { height: 100%; }
+    details summary { list-style: none; }
+    details summary::-webkit-details-marker { display: none; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+    button:focus-visible { outline: 2px solid #2563eb; outline-offset: 2px; }
+    input:focus { outline: 2px solid #2563eb !important; outline-offset: 0; border-color: #2563eb !important; }
+    ::-webkit-scrollbar { height: 4px; width: 4px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #e8e6e1; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    // ── Storage ────────────────────────────────────────────────────────────────
+    const STORE = {
+      get: (k, fb = null) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : fb; } catch { return fb; } },
+      set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+    };
+
+    const todayKey = () => new Date().toISOString().slice(0, 10);
+    const weekKey  = () => { const d = new Date(); const day = d.getDay() || 7; d.setDate(d.getDate() - day + 1); return d.toISOString().slice(0, 10); };
+    const fmtDate  = () => new Date().toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long" });
+    const pct      = (u, t) => t > 0 ? Math.min(u / t, 1) : 0;
+
+    // ── API ────────────────────────────────────────────────────────────────────
+    async function estimateFood(desc, clarify = null) {
+      const prompt = clarify
+        ? `Previously estimated: "${desc}". User clarifies: "${clarify}". Revise. JSON only: {"calories":n,"protein":n,"carbs":n,"fat":n,"summary":"str","confidence":"low|medium|high"}`
+        : `Estimate nutrition for: "${desc}". UK portions: spoonful=15ml, cup=240ml, knob=10g, handful=30g. JSON only: {"calories":n,"protein":n,"carbs":n,"fat":n,"summary":"str","confidence":"low|medium|high"}`;
+      const res  = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1000, system: "UK nutrition estimator. JSON only, no markdown.", messages: [{ role: "user", content: prompt }] }),
+      });
+      const data = await res.json();
+      const text = data.content?.map(b => b.text || "").join("") || "{}";
+      try { return JSON.parse(text.replace(/```json|```/g, "").trim()); }
+      catch { return { calories: 0, protein: 0, carbs: 0, fat: 0, summary: desc, confidence: "low" }; }
+    }
+
+    async function getMealSuggestions(remainCal, macroLeft) {
+      const prompt = `UK nutrition advisor. User needs today:
+- ${remainCal} kcal remaining
+- Protein: ${macroLeft.protein}g remaining
+- Carbs: ${macroLeft.carbs}g remaining
+- Fat: ${macroLeft.fat}g remaining
+Suggest 3 specific, practical UK meals or snacks. JSON only: {"suggestions":[{"name":"str","description":"str","calories":n,"protein":n,"carbs":n,"fat":n}]}`;
+      const res  = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1000, system: "UK nutrition advisor. JSON only.", messages: [{ role: "user", content: prompt }] }),
+      });
+      const data = await res.json();
+      const text = data.content?.map(b => b.text || "").join("") || "{}";
+      try { return JSON.parse(text.replace(/```json|```/g, "").trim()); }
+      catch { return { suggestions: [] }; }
+    }
+
+    async function searchOFF(query) {
+      try {
+        const res  = await fetch(`https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(query)}&search_simple=1&action=process&json=1&page_size=3&lc=en&cc=gb`);
+        const data = await res.json();
+        const p    = data.products?.find(p => p.nutriments?.["energy-kcal_100g"]);
+        if (!p) return null;
+        const n = p.nutriments; const s = parseFloat(p.serving_size) || 100; const f = s / 100;
+        return { calories: Math.round((n["energy-kcal_100g"]||0)*f), protein: Math.round((n["proteins_100g"]||0)*f), carbs: Math.round((n["carbohydrates_100g"]||0)*f), fat: Math.round((n["fat_100g"]||0)*f), summary: p.product_name || query, confidence: "high" };
+      } catch { return null; }
+    }
+
+    function calcMacros(kcal) {
+      return { protein: Math.round(kcal * 0.30 / 4), carbs: Math.round(kcal * 0.40 / 4), fat: Math.round(kcal * 0.30 / 9) };
+    }
+
+    // ── Tokens ─────────────────────────────────────────────────────────────────
+    const C = {
+      bg: "#fafaf8", surface: "#ffffff", border: "#e8e6e1",
+      text: "#1a1917", muted: "#8a8880", faint: "#f0ede8",
+      accent: "#2563eb", green: "#16a34a", amber: "#d97706", red: "#dc2626",
+      protein: "#6366f1", carbs: "#0891b2", fat: "#ea580c",
+    };
+
+    const cardS  = { background: C.surface, borderRadius: 12, border: `1px solid ${C.border}`, overflow: "hidden" };
+    const labelS = { fontSize: 11, fontWeight: 600, letterSpacing: "0.07em", textTransform: "uppercase", color: C.muted };
+    const primaryBtn = { padding:"10px 20px", fontSize:14, fontWeight:600, cursor:"pointer", border:"none", borderRadius:8, background:C.accent, color:"#fff", fontFamily:"inherit" };
+    const ghostBtn   = { padding:"10px 16px", fontSize:14, fontWeight:500, cursor:"pointer", border:`1.5px solid ${C.border}`, borderRadius:8, background:"transparent", color:C.text, fontFamily:"inherit" };
+
+    // ── Components ─────────────────────────────────────────────────────────────
+    function Pill({ children, color }) {
+      return <span style={{ fontSize:10, fontWeight:700, letterSpacing:"0.06em", textTransform:"uppercase", background:color+"18", color, padding:"2px 7px", borderRadius:4 }}>{children}</span>;
+    }
+
+    function ProgressBar({ used, total, color, thin }) {
+      const ratio    = pct(used, total);
+      const barColor = color || (ratio >= 1 ? C.red : ratio >= 0.88 ? C.amber : C.accent);
+      const h        = thin ? 4 : 6;
+      return (
+        <div style={{ height:h, background:C.faint, borderRadius:h }}>
+          <div style={{ height:h, width:`${ratio*100}%`, background:barColor, borderRadius:h, transition:"width 0.5s cubic-bezier(.4,0,.2,1)" }} />
+        </div>
+      );
+    }
+
+    function MacroRow({ protein, carbs, fat, small }) {
+      const sz = small ? 11 : 12;
+      return (
+        <div style={{ display:"flex", gap:8 }}>
+          {[["P", protein, C.protein], ["C", carbs, C.carbs], ["F", fat, C.fat]].map(([l,v,c]) => (
+            <span key={l} style={{ fontSize:sz, color:c, fontWeight:600 }}>{l} {v}g</span>
+          ))}
+        </div>
+      );
+    }
+
+    function Divider() { return <div style={{ height:1, background:C.border, margin:"20px 0" }} />; }
+
+    // ── App ────────────────────────────────────────────────────────────────────
+    function App() {
+      const [view,          setView]          = useState("today");
+      const [weeklyTarget,  setWeeklyTarget]  = useState(() => STORE.get("weeklyTarget", 0));
+      const [macroTargets,  setMacroTargets]  = useState(() => STORE.get("macroTargets", null));
+      const [logs,          setLogs]          = useState(() => STORE.get("logs", {}));
+      const [recentFoods,   setRecentFoods]   = useState(() => STORE.get("recentFoods", []));
+      const [phase,         setPhase]         = useState("idle");
+      const [transcript,    setTranscript]    = useState("");
+      const [pending,       setPending]       = useState(null);
+      const [clarify,       setClarify]       = useState("");
+      const [clarListening, setClarListening] = useState(false);
+      const [errMsg,        setErrMsg]        = useState("");
+      const [suggestions,   setSuggestions]   = useState(null);
+      const [loadingSugg,   setLoadingSugg]   = useState(false);
+      const [tgtInput,      setTgtInput]      = useState(() => String(STORE.get("weeklyTarget","") || ""));
+      const [mInputs,       setMInputs]       = useState(() => STORE.get("macroTargets", { protein:"", carbs:"", fat:"" }));
+      const recRef = useRef(null);
+
+      useEffect(() => { STORE.set("logs",         logs);         }, [logs]);
+      useEffect(() => { STORE.set("recentFoods",  recentFoods);  }, [recentFoods]);
+      useEffect(() => { STORE.set("weeklyTarget", weeklyTarget); }, [weeklyTarget]);
+      useEffect(() => { STORE.set("macroTargets", macroTargets); }, [macroTargets]);
+
+      const dailyTarget = weeklyTarget > 0 ? Math.round(weeklyTarget / 7) : 0;
+      const autoMacros  = dailyTarget > 0 ? calcMacros(dailyTarget) : { protein:0, carbs:0, fat:0 };
+      const effMacros   = macroTargets || autoMacros;
+      const todayLogs   = logs[todayKey()] || [];
+      const todayTotal  = todayLogs.reduce((s,e) => s+e.calories, 0);
+      const todayMacros = todayLogs.reduce((s,e) => ({ protein:s.protein+(e.protein||0), carbs:s.carbs+(e.carbs||0), fat:s.fat+(e.fat||0) }), { protein:0, carbs:0, fat:0 });
+      const weekTotal   = (() => { const d=new Date(); const dow=(d.getDay()+6)%7; let s=0; for(let i=0;i<=dow;i++){const dd=new Date(d);dd.setDate(d.getDate()-dow+i);s+=(logs[dd.toISOString().slice(0,10)]||[]).reduce((x,e)=>x+e.calories,0);} return s; })();
+
+      const startListen = useCallback((onResult, onEnd) => {
+        if (!("webkitSpeechRecognition" in window) && !("SpeechRecognition" in window)) { setErrMsg("Voice requires Chrome on desktop or Android."); return; }
+        const SR  = window.SpeechRecognition || window.webkitSpeechRecognition;
+        const rec = new SR(); rec.lang="en-GB"; rec.interimResults=false; rec.maxAlternatives=1;
+        rec.onresult = e => onResult(e.results[0][0].transcript);
+        rec.onend    = onEnd;
+        rec.onerror  = e => { setErrMsg("Mic error: "+e.error+". Check your browser has mic permission for this site."); setPhase("idle"); };
+        recRef.current = rec; rec.start();
+      }, []);
+
+      const processFood = async (text) => {
+        if (!text.trim()) { setPhase("idle"); return; }
+        setPhase("processing");
+        const branded = await searchOFF(text);
+        const result  = branded || await estimateFood(text);
+        setPending({ ...result, original: text });
+        setPhase("confirming");
+      };
+
+      const handleMic = () => {
+        if (phase !== "idle") return;
+        setErrMsg(""); setTranscript(""); setPhase("listening");
+        let cap = "";
+        startListen(t => { cap=t; setTranscript(t); }, async () => { await processFood(cap); });
+      };
+
+      const handleClarifyMic = () => {
+        setClarListening(true); let cap = "";
+        startListen(t => { cap=t; setClarify(t); }, async () => {
+          setClarListening(false);
+          if (!cap.trim()) return;
+          setPhase("processing");
+          const rev = await estimateFood(pending.original, cap);
+          setPending(prev => ({ ...prev, ...rev }));
+          setPhase("confirming"); setClarify("");
+        });
+      };
+
+      const confirmLog = () => {
+        const entry = { id:Date.now(), time:new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"}), summary:pending.summary, calories:pending.calories, protein:pending.protein||0, carbs:pending.carbs||0, fat:pending.fat||0, confidence:pending.confidence };
+        setLogs(prev => ({ ...prev, [todayKey()]:[...(prev[todayKey()]||[]),entry] }));
+        setRecentFoods(prev => [{ summary:pending.summary, calories:pending.calories, protein:pending.protein||0, carbs:pending.carbs||0, fat:pending.fat||0 }, ...prev.filter(f=>f.summary!==pending.summary)].slice(0,30));
+        setPending(null); setTranscript(""); setPhase("idle"); setSuggestions(null);
+      };
+
+      const cancelLog   = () => { setPending(null); setTranscript(""); setPhase("idle"); };
+      const deleteEntry = (dk,id) => { setLogs(prev=>({...prev,[dk]:(prev[dk]||[]).filter(e=>e.id!==id)})); setSuggestions(null); };
+      const logRecent   = f => { const entry={id:Date.now(),time:new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"}),summary:f.summary,calories:f.calories,protein:f.protein||0,carbs:f.carbs||0,fat:f.fat||0,confidence:"high"}; setLogs(prev=>({...prev,[todayKey()]:[...(prev[todayKey()]||[]),entry]})); setSuggestions(null); };
+
+      const fetchSugg = async () => {
+        setLoadingSugg(true); setSuggestions(null);
+        const rem = Math.max(0, dailyTarget-todayTotal);
+        const ml  = { protein:Math.max(0,effMacros.protein-todayMacros.protein), carbs:Math.max(0,effMacros.carbs-todayMacros.carbs), fat:Math.max(0,effMacros.fat-todayMacros.fat) };
+        const r   = await getMealSuggestions(rem, ml);
+        setSuggestions(r.suggestions||[]); setLoadingSugg(false);
+      };
+
+      const Page      = ({ children }) => <div style={{ padding:"24px 20px 32px" }}>{children}</div>;
+      const PageTitle = ({ title, sub }) => <div style={{ marginBottom:24 }}><h1 style={{ fontSize:22, fontWeight:700, color:C.text, letterSpacing:"-0.02em", marginBottom:sub?4:0 }}>{title}</h1>{sub&&<p style={{ fontSize:13, color:C.muted }}>{sub}</p>}</div>;
+
+      // ── Overlay ──
+      const renderOverlay = () => {
+        if (phase === "idle") return null;
+        return (
+          <div style={{ position:"fixed",inset:0,background:"rgba(26,25,23,0.5)",zIndex:200,display:"flex",alignItems:"flex-end",justifyContent:"center",backdropFilter:"blur(4px)" }}
+            onClick={e => e.target===e.currentTarget && cancelLog()}>
+            <div style={{ background:C.surface,width:"100%",maxWidth:560,borderRadius:"20px 20px 0 0",padding:28,boxShadow:"0 -8px 40px rgba(0,0,0,0.12)" }}>
+              {(phase==="listening"||phase==="processing") && (
+                <div style={{ textAlign:"center",padding:"16px 0" }}>
+                  <div style={{ width:56,height:56,borderRadius:"50%",background:phase==="listening"?C.red+"18":C.faint,display:"flex",alignItems:"center",justifyContent:"center",fontSize:24,margin:"0 auto 16px",border:`2px solid ${phase==="listening"?C.red:C.border}` }}>
+                    {phase==="listening"?"🎙":"⏳"}
+                  </div>
+                  <p style={{ fontSize:18,fontWeight:600,color:C.text,marginBottom:6 }}>{phase==="listening"?"Listening…":"Estimating…"}</p>
+                  {transcript&&<p style={{ fontSize:14,color:C.muted,marginBottom:16,fontStyle:"italic" }}>"{transcript}"</p>}
+                  {phase==="listening"&&<button onClick={cancelLog} style={ghostBtn}>Cancel</button>}
+                </div>
+              )}
+              {phase==="confirming"&&pending&&(
+                <div>
+                  <p style={{ ...labelS, marginBottom:12 }}>Review entry</p>
+                  <div style={{ background:C.faint,borderRadius:10,padding:16,marginBottom:16 }}>
+                    <p style={{ fontSize:16,fontWeight:600,color:C.text,marginBottom:8 }}>{pending.summary}</p>
+                    <div style={{ display:"flex",alignItems:"baseline",gap:8,marginBottom:10 }}>
+                      <span style={{ fontSize:32,fontWeight:700,color:C.text,letterSpacing:"-0.03em" }}>{pending.calories}</span>
+                      <span style={{ fontSize:14,color:C.muted }}>kcal</span>
+                      <Pill color={pending.confidence==="high"?C.green:pending.confidence==="medium"?C.amber:C.muted}>{pending.confidence}</Pill>
+                    </div>
+                    <MacroRow protein={pending.protein||0} carbs={pending.carbs||0} fat={pending.fat||0} />
+                  </div>
+                  <p style={{ fontSize:11,color:C.muted,marginBottom:8 }}>You said: "{pending.original}"</p>
+                  <details style={{ marginBottom:16 }}>
+                    <summary style={{ fontSize:13,color:C.accent,cursor:"pointer",fontWeight:600,padding:"8px 0",listStyle:"none" }}>Refine this estimate ›</summary>
+                    <div style={{ paddingTop:8 }}>
+                      <p style={{ fontSize:12,color:C.muted,marginBottom:8 }}>Clarify the portion or ingredients</p>
+                      <button onClick={handleClarifyMic} style={{ ...ghostBtn, marginBottom:6, color:clarListening?C.red:C.accent, borderColor:clarListening?C.red:C.border }}>
+                        {clarListening?"🔴 Listening…":"🎙 Speak clarification"}
+                      </button>
+                      {clarify&&<p style={{ fontSize:12,color:C.muted,fontStyle:"italic",marginTop:4 }}>"{clarify}"</p>}
+                    </div>
+                  </details>
+                  <div style={{ display:"flex",gap:10 }}>
+                    <button onClick={confirmLog} style={primaryBtn}>Log it</button>
+                    <button onClick={cancelLog}  style={ghostBtn}>Discard</button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      };
+
+      // ── Today ──
+      const renderToday = () => {
+        const calRatio = pct(todayTotal, dailyTarget||1);
+        return (
+          <Page>
+            <div style={{ marginBottom:28 }}>
+              <p style={{ ...labelS, marginBottom:2 }}>{fmtDate()}</p>
+              <h1 style={{ fontSize:22,fontWeight:700,color:C.text,letterSpacing:"-0.02em" }}>Today</h1>
+            </div>
+            <div style={{ ...cardS, padding:20, marginBottom:12 }}>
+              <div style={{ display:"flex",justifyContent:"space-between",alignItems:"flex-end",marginBottom:12 }}>
+                <div>
+                  <p style={labelS}>Calories today</p>
+                  <div style={{ display:"flex",alignItems:"baseline",gap:6,marginTop:4 }}>
+                    <span style={{ fontSize:36,fontWeight:700,color:C.text,letterSpacing:"-0.03em" }}>{todayTotal.toLocaleString()}</span>
+                    <span style={{ fontSize:14,color:C.muted }}>/ {dailyTarget>0?dailyTarget.toLocaleString():"—"}</span>
+                  </div>
+                </div>
+                <div style={{ textAlign:"right" }}>
+                  <p style={labelS}>This week</p>
+                  <p style={{ fontSize:18,fontWeight:600,color:C.text,marginTop:4 }}>{weekTotal.toLocaleString()}<span style={{ fontSize:12,color:C.muted,marginLeft:4 }}>/ {weeklyTarget>0?weeklyTarget.toLocaleString():"—"}</span></p>
+                </div>
+              </div>
+              <ProgressBar used={todayTotal} total={dailyTarget||2000} />
+              {dailyTarget>0&&<p style={{ fontSize:12,color:calRatio>=1?C.red:C.muted,marginTop:8,fontWeight:calRatio>=1?600:400 }}>{calRatio>=1?`${(todayTotal-dailyTarget).toLocaleString()} kcal over`:`${(dailyTarget-todayTotal).toLocaleString()} kcal remaining`}</p>}
+            </div>
+            {weeklyTarget>0&&(
+              <div style={{ ...cardS, padding:"14px 20px", marginBottom:20 }}>
+                <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8 }}>
+                  <p style={labelS}>Weekly progress</p>
+                  <p style={{ fontSize:12,color:C.muted }}>{Math.round(pct(weekTotal,weeklyTarget)*100)}%</p>
+                </div>
+                <ProgressBar used={weekTotal} total={weeklyTarget} thin />
+              </div>
+            )}
+            {weeklyTarget===0&&(
+              <div style={{ background:C.amber+"12",border:`1px solid ${C.amber}30`,borderRadius:10,padding:"12px 16px",marginBottom:20 }}>
+                <p style={{ fontSize:13,color:C.amber,fontWeight:600 }}>Set a weekly target in Settings to track progress</p>
+              </div>
+            )}
+            <div style={{ textAlign:"center",margin:"28px 0 24px" }}>
+              <button onClick={handleMic} disabled={phase!=="idle"} style={{ width:72,height:72,borderRadius:"50%",border:`2px solid ${phase==="listening"?C.red:C.border}`,background:phase==="listening"?C.red+"10":C.surface,display:"inline-flex",alignItems:"center",justifyContent:"center",fontSize:26,cursor:phase==="idle"?"pointer":"default",boxShadow:phase==="listening"?`0 0 0 6px ${C.red}18`:"0 2px 12px rgba(0,0,0,0.06)",transition:"all 0.2s" }}>🎙</button>
+              <p style={{ fontSize:12,color:C.muted,marginTop:10,letterSpacing:"0.04em" }}>{phase==="idle"?"tap to log food":phase==="processing"?"estimating…":""}</p>
+            </div>
+            {errMsg&&<p style={{ fontSize:12,color:C.red,textAlign:"center",marginBottom:12 }}>{errMsg}</p>}
+            {recentFoods.length>0&&(
+              <div style={{ marginBottom:24 }}>
+                <p style={{ ...labelS, marginBottom:10 }}>Quick add</p>
+                <div style={{ display:"flex",gap:8,overflowX:"auto",paddingBottom:4 }}>
+                  {recentFoods.slice(0,6).map((f,i)=>(
+                    <button key={i} onClick={()=>logRecent(f)} style={{ background:C.surface,border:`1px solid ${C.border}`,borderRadius:10,padding:"10px 14px",cursor:"pointer",fontFamily:"inherit",display:"flex",flexDirection:"column",gap:3,flexShrink:0,textAlign:"left" }}>
+                      <span style={{ fontSize:13,fontWeight:600,color:C.text,whiteSpace:"nowrap",maxWidth:120,overflow:"hidden",textOverflow:"ellipsis" }}>{f.summary}</span>
+                      <span style={{ fontSize:12,color:C.muted }}>{f.calories} kcal</span>
+                      <MacroRow protein={f.protein||0} carbs={f.carbs||0} fat={f.fat||0} small />
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+            {todayLogs.length>0?(
+              <div>
+                <p style={{ ...labelS, marginBottom:12 }}>Today's log</p>
+                <div style={cardS}>
+                  {todayLogs.map((e,i)=>(
+                    <div key={e.id} style={{ padding:"14px 16px",borderBottom:i<todayLogs.length-1?`1px solid ${C.border}`:"none",display:"flex",alignItems:"center",gap:12 }}>
+                      <span style={{ fontSize:11,color:C.muted,whiteSpace:"nowrap",width:36 }}>{e.time}</span>
+                      <div style={{ flex:1,minWidth:0 }}>
+                        <p style={{ fontSize:14,fontWeight:500,color:C.text,marginBottom:3,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap" }}>{e.summary}</p>
+                        <MacroRow protein={e.protein||0} carbs={e.carbs||0} fat={e.fat||0} small />
+                      </div>
+                      <div style={{ textAlign:"right",flexShrink:0 }}>
+                        <p style={{ fontSize:15,fontWeight:600,color:C.text }}>{e.calories}</p>
+                        <p style={{ fontSize:11,color:C.muted }}>kcal</p>
+                      </div>
+                      <button onClick={()=>deleteEntry(todayKey(),e.id)} style={{ background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:18,padding:"0 4px",lineHeight:1 }}>×</button>
+                    </div>
+                  ))}
+                  <div style={{ padding:"12px 16px",background:C.faint,display:"flex",justifyContent:"space-between",alignItems:"center" }}>
+                    <span style={{ fontSize:12,fontWeight:600,color:C.muted,letterSpacing:"0.05em",textTransform:"uppercase" }}>Total</span>
+                    <div style={{ display:"flex",gap:16,alignItems:"center" }}>
+                      <MacroRow protein={todayMacros.protein} carbs={todayMacros.carbs} fat={todayMacros.fat} small />
+                      <span style={{ fontSize:15,fontWeight:700,color:C.text }}>{todayTotal} kcal</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ):(
+              <div style={{ textAlign:"center",padding:"20px 0" }}>
+                <p style={{ fontSize:14,color:C.muted }}>Nothing logged yet</p>
+              </div>
+            )}
+          </Page>
+        );
+      };
+
+      // ── Macros ──
+      const renderMacros = () => {
+        const remaining = Math.max(0, dailyTarget-todayTotal);
+        return (
+          <Page>
+            <PageTitle title="Macros" sub={fmtDate()} />
+            {effMacros.protein===0&&(
+              <div style={{ background:C.amber+"12",border:`1px solid ${C.amber}30`,borderRadius:10,padding:"12px 16px",marginBottom:20 }}>
+                <p style={{ fontSize:13,color:C.amber,fontWeight:600 }}>Set a weekly calorie target in Settings to enable macro tracking</p>
+              </div>
+            )}
+            <div style={{ ...cardS, padding:20, marginBottom:12 }}>
+              {[["Protein",todayMacros.protein,effMacros.protein,C.protein],["Carbohydrates",todayMacros.carbs,effMacros.carbs,C.carbs],["Fat",todayMacros.fat,effMacros.fat,C.fat]].map(([name,used,total,color],i,arr)=>(
+                <div key={name} style={{ marginBottom:i<arr.length-1?20:0 }}>
+                  <div style={{ display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:6 }}>
+                    <span style={{ fontSize:14,fontWeight:600,color:C.text }}>{name}</span>
+                    <span style={{ fontSize:13,color:C.muted }}><strong style={{ color:C.text }}>{used}g</strong> / {total}g</span>
+                  </div>
+                  <ProgressBar used={used} total={total||1} color={color} />
+                  <p style={{ fontSize:12,color:used>total?C.red:C.muted,marginTop:5 }}>{used>total?`${used-total}g over`:`${Math.max(0,total-used)}g remaining`}</p>
+                </div>
+              ))}
+            </div>
+            <div style={{ display:"flex",gap:8,marginBottom:24,flexWrap:"wrap" }}>
+              {[["Calories left",remaining,"kcal"],["Protein left",Math.max(0,effMacros.protein-todayMacros.protein),"g"],["Carbs left",Math.max(0,effMacros.carbs-todayMacros.carbs),"g"],["Fat left",Math.max(0,effMacros.fat-todayMacros.fat),"g"]].map(([l,v,u])=>(
+                <div key={l} style={{ background:C.surface,border:`1px solid ${C.border}`,borderRadius:10,padding:"10px 14px",flex:1,minWidth:80 }}>
+                  <p style={{ ...labelS, marginBottom:4 }}>{l}</p>
+                  <p style={{ fontSize:18,fontWeight:700,color:C.text }}>{v.toLocaleString()}<span style={{ fontSize:11,color:C.muted,marginLeft:3 }}>{u}</span></p>
+                </div>
+              ))}
+            </div>
+            <Divider />
+            <p style={{ fontSize:16,fontWeight:600,color:C.text,marginBottom:4 }}>What should I eat?</p>
+            <p style={{ fontSize:13,color:C.muted,marginBottom:14 }}>Get suggestions based on what you still need today.</p>
+            <button onClick={fetchSugg} disabled={loadingSugg} style={{ ...primaryBtn, opacity:loadingSugg?0.6:1 }}>{loadingSugg?"Finding suggestions…":"Suggest meals"}</button>
+            {suggestions&&suggestions.length>0&&(
+              <div style={{ marginTop:20 }}>
+                {suggestions.map((s,i)=>(
+                  <div key={i} style={{ ...cardS, padding:16, marginBottom:10 }}>
+                    <p style={{ fontSize:15,fontWeight:600,color:C.text,marginBottom:4 }}>{s.name}</p>
+                    <p style={{ fontSize:13,color:C.muted,marginBottom:10,lineHeight:1.5 }}>{s.description}</p>
+                    <div style={{ display:"flex",alignItems:"center",gap:12,flexWrap:"wrap" }}>
+                      <span style={{ fontSize:15,fontWeight:700,color:C.text }}>{s.calories} kcal</span>
+                      <MacroRow protein={s.protein||0} carbs={s.carbs||0} fat={s.fat||0} />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+            {suggestions&&suggestions.length===0&&<p style={{ fontSize:13,color:C.muted,marginTop:12 }}>No suggestions — try logging some food first.</p>}
+          </Page>
+        );
+      };
+
+      // ── Week ──
+      const renderWeek = () => {
+        const days=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]; const today=new Date(); const todayDow=(today.getDay()+6)%7;
+        const totals=days.map((_,i)=>{ const d=new Date(today);d.setDate(d.getDate()-todayDow+i);return(logs[d.toISOString().slice(0,10)]||[]).reduce((s,e)=>s+e.calories,0); });
+        const maxVal=Math.max(...totals,dailyTarget||1,1); const daysElapsed=todayDow+1; const avgDaily=daysElapsed>0?Math.round(weekTotal/daysElapsed):0;
+        return (
+          <Page>
+            <PageTitle title="This week" sub={`w/c ${weekKey()}`} />
+            <div style={{ ...cardS, padding:20, marginBottom:12 }}>
+              <div style={{ display:"flex",justifyContent:"space-between",alignItems:"flex-end",marginBottom:12 }}>
+                <div>
+                  <p style={labelS}>Week total</p>
+                  <div style={{ display:"flex",alignItems:"baseline",gap:6,marginTop:4 }}>
+                    <span style={{ fontSize:30,fontWeight:700,color:C.text,letterSpacing:"-0.03em" }}>{weekTotal.toLocaleString()}</span>
+                    <span style={{ fontSize:13,color:C.muted }}>/ {weeklyTarget>0?weeklyTarget.toLocaleString():"—"}</span>
+                  </div>
+                </div>
+                <div style={{ textAlign:"right" }}>
+                  <p style={labelS}>Remaining</p>
+                  <p style={{ fontSize:16,fontWeight:600,color:weekTotal>weeklyTarget&&weeklyTarget>0?C.red:C.text,marginTop:4 }}>{weeklyTarget>0?Math.abs(weeklyTarget-weekTotal).toLocaleString():"—"}<span style={{ fontSize:12,color:C.muted,marginLeft:3 }}>kcal</span></p>
+                </div>
+              </div>
+              <ProgressBar used={weekTotal} total={weeklyTarget||14000} />
+            </div>
+            <div style={{ display:"flex",gap:8,marginBottom:20,flexWrap:"wrap" }}>
+              {[["Daily avg",avgDaily,"kcal"],["Projected",Math.round(avgDaily*7),"kcal"],["Target",weeklyTarget||"—","kcal"]].map(([l,v,u])=>(
+                <div key={l} style={{ background:C.surface,border:`1px solid ${C.border}`,borderRadius:10,padding:"10px 14px",flex:1,minWidth:90 }}>
+                  <p style={{ ...labelS, marginBottom:4 }}>{l}</p>
+                  <p style={{ fontSize:18,fontWeight:700,color:C.text }}>{typeof v==="number"?v.toLocaleString():v}<span style={{ fontSize:11,color:C.muted,marginLeft:3 }}>{u}</span></p>
+                </div>
+              ))}
+            </div>
+            <p style={{ ...labelS, marginBottom:12 }}>Daily breakdown</p>
+            <div style={{ ...cardS, padding:"20px 16px" }}>
+              <div style={{ display:"flex",gap:6,alignItems:"flex-end",height:100,marginBottom:10 }}>
+                {days.map((d,i)=>{
+                  const val=totals[i]; const isFuture=i>todayDow; const isCurrent=i===todayDow;
+                  const ratio=pct(val,dailyTarget); const color=isFuture||val===0?"#e8e6e1":ratio>=1?C.red:ratio>=0.88?C.amber:C.accent;
+                  return (
+                    <div key={d} style={{ flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:4 }}>
+                      <span style={{ fontSize:9,color:C.muted,minHeight:12 }}>{val>0&&!isFuture?val>999?`${Math.round(val/100)/10}k`:val:""}</span>
+                      <div style={{ width:"100%",height:72,display:"flex",alignItems:"flex-end" }}>
+                        <div style={{ width:"100%",background:color,height:`${Math.max((val/maxVal)*72,val>0?3:0)}px`,borderRadius:"3px 3px 0 0",outline:isCurrent?`2px solid ${C.text}`:"",outlineOffset:1,transition:"height 0.4s" }} />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <div style={{ display:"flex",gap:6 }}>
+                {days.map((d,i)=><div key={d} style={{ flex:1,textAlign:"center",fontSize:10,fontWeight:i===todayDow?700:400,color:i===todayDow?C.text:C.muted }}>{d}</div>)}
+              </div>
+            </div>
+          </Page>
+        );
+      };
+
+      // ── Month ──
+      const renderMonth = () => {
+        const now=new Date(); const dim=new Date(now.getFullYear(),now.getMonth()+1,0).getDate(); const td=now.getDate();
+        const monthTotal=Array.from({length:dim},(_,i)=>(logs[`${now.toISOString().slice(0,7)}-${String(i+1).padStart(2,"0")}`]||[]).reduce((s,e)=>s+e.calories,0)).reduce((a,b)=>a+b,0);
+        return (
+          <Page>
+            <PageTitle title={now.toLocaleString("en-GB",{month:"long",year:"numeric"})} sub={`${monthTotal.toLocaleString()} kcal logged this month`} />
+            <div style={{ ...cardS, padding:20, marginBottom:20 }}>
+              <div style={{ display:"flex",flexWrap:"wrap",gap:6 }}>
+                {Array.from({length:dim},(_,i)=>{
+                  const d=i+1; const key=`${now.toISOString().slice(0,7)}-${String(d).padStart(2,"0")}`;
+                  const total=(logs[key]||[]).reduce((s,e)=>s+e.calories,0); const ratio=pct(total,dailyTarget);
+                  const isFuture=d>td; const bg=isFuture||total===0?"#f0ede8":ratio>=1?C.red:ratio>=0.88?C.amber:C.green;
+                  return <div key={d} title={`${d}: ${total} kcal`} style={{ width:36,height:36,borderRadius:8,background:bg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,fontWeight:700,color:isFuture||total===0?C.muted:"#fff",border:d===td?`2px solid ${C.text}`:"2px solid transparent",opacity:isFuture?0.4:1 }}>{d}</div>;
+                })}
+              </div>
+            </div>
+            <div style={{ display:"flex",gap:16,flexWrap:"wrap" }}>
+              {[[C.green,"Under target"],[C.amber,"Near limit"],[C.red,"Over target"]].map(([c,l])=>(
+                <div key={l} style={{ display:"flex",alignItems:"center",gap:6,fontSize:12,color:C.muted }}>
+                  <div style={{ width:10,height:10,borderRadius:3,background:c }} />{l}
+                </div>
+              ))}
+            </div>
+          </Page>
+        );
+      };
+
+      // ── Settings ──
+      const renderSettings = () => {
+        const suggested = dailyTarget>0?calcMacros(dailyTarget):null;
+        return (
+          <Page>
+            <PageTitle title="Settings" />
+            <div style={{ marginBottom:28 }}>
+              <p style={{ fontSize:15,fontWeight:600,color:C.text,marginBottom:4 }}>Weekly calorie target</p>
+              <p style={{ fontSize:13,color:C.muted,marginBottom:12 }}>Update this at the start of each week.</p>
+              <div style={{ display:"flex",gap:12,alignItems:"flex-end",flexWrap:"wrap" }}>
+                <div style={{ flex:1,minWidth:140 }}>
+                  <label style={{ ...labelS, display:"block",marginBottom:6 }}>Calories per week</label>
+                  <input type="number" value={tgtInput} onChange={e=>setTgtInput(e.target.value)} placeholder="e.g. 14000"
+                    style={{ width:"100%",padding:"10px 12px",fontSize:16,border:`1.5px solid ${C.border}`,borderRadius:8,fontFamily:"inherit",outline:"none",color:C.text,background:C.surface }} />
+                  {tgtInput&&parseInt(tgtInput)>0&&<p style={{ fontSize:11,color:C.muted,marginTop:4 }}>{Math.round(parseInt(tgtInput)/7).toLocaleString()} kcal/day</p>}
+                </div>
+                <button onClick={()=>{ const n=parseInt(tgtInput);if(!isNaN(n)&&n>0)setWeeklyTarget(n); }} style={primaryBtn}>Save</button>
+              </div>
+            </div>
+            <Divider />
+            <div style={{ marginBottom:28 }}>
+              <p style={{ fontSize:15,fontWeight:600,color:C.text,marginBottom:4 }}>Daily macro targets</p>
+              <p style={{ fontSize:13,color:C.muted,marginBottom:suggested?8:16 }}>Default split: 30% protein · 40% carbs · 30% fat. Override below.</p>
+              {suggested&&(
+                <div style={{ background:C.faint,borderRadius:8,padding:"10px 14px",marginBottom:14,display:"flex",gap:16,flexWrap:"wrap" }}>
+                  <span style={{ fontSize:12,color:C.muted }}>Suggested:</span>
+                  {[["Protein",suggested.protein,C.protein],["Carbs",suggested.carbs,C.carbs],["Fat",suggested.fat,C.fat]].map(([l,v,c])=>(
+                    <span key={l} style={{ fontSize:12,color:c,fontWeight:600 }}>{l}: {v}g</span>
+                  ))}
+                </div>
+              )}
+              <div style={{ display:"flex",gap:10,flexWrap:"wrap",marginBottom:12 }}>
+                {[["protein","Protein",C.protein],["carbs","Carbs",C.carbs],["fat","Fat",C.fat]].map(([key,lbl,color])=>(
+                  <div key={key} style={{ flex:1,minWidth:90 }}>
+                    <label style={{ ...labelS, display:"block",marginBottom:5,color }}>{lbl} (g)</label>
+                    <input type="number" value={mInputs[key]||""} onChange={e=>setMInputs(p=>({...p,[key]:e.target.value}))}
+                      placeholder={suggested?String(suggested[key]):"—"}
+                      style={{ width:"100%",padding:"10px 12px",fontSize:15,border:`1.5px solid ${C.border}`,borderRadius:8,fontFamily:"inherit",outline:"none",color:C.text,background:C.surface }} />
+                  </div>
+                ))}
+              </div>
+              <div style={{ display:"flex",gap:10,flexWrap:"wrap" }}>
+                <button onClick={()=>{ const p=parseInt(mInputs.protein),c=parseInt(mInputs.carbs),f=parseInt(mInputs.fat);if(!isNaN(p)&&!isNaN(c)&&!isNaN(f)&&p>0&&c>0&&f>0){setMacroTargets({protein:p,carbs:c,fat:f});setMInputs({protein:String(p),carbs:String(c),fat:String(f)});} }} style={primaryBtn}>Save macros</button>
+                <button onClick={()=>{setMacroTargets(null);setMInputs({protein:"",carbs:"",fat:""}); }} style={ghostBtn}>Reset to suggested</button>
+              </div>
+            </div>
+            <Divider />
+            <div style={{ marginBottom:28 }}>
+              <p style={{ fontSize:15,fontWeight:600,color:C.text,marginBottom:4 }}>Saved foods</p>
+              <p style={{ fontSize:13,color:C.muted,marginBottom:12 }}>{recentFoods.length} food{recentFoods.length!==1?"s":""} saved.</p>
+              {recentFoods.length>0&&(
+                <div style={cardS}>
+                  {recentFoods.map((f,i)=>(
+                    <div key={i} style={{ padding:"12px 16px",borderBottom:i<recentFoods.length-1?`1px solid ${C.border}`:"none",display:"flex",alignItems:"center",gap:12 }}>
+                      <div style={{ flex:1,minWidth:0 }}>
+                        <p style={{ fontSize:13,fontWeight:500,color:C.text,marginBottom:3 }}>{f.summary}</p>
+                        <MacroRow protein={f.protein||0} carbs={f.carbs||0} fat={f.fat||0} small />
+                      </div>
+                      <span style={{ fontSize:14,fontWeight:600,color:C.text,flexShrink:0 }}>{f.calories} kcal</span>
+                      <button onClick={()=>setRecentFoods(p=>p.filter((_,j)=>j!==i))} style={{ background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:18,padding:"0 4px" }}>×</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+            <Divider />
+            <div>
+              <p style={{ fontSize:15,fontWeight:600,color:C.text,marginBottom:4 }}>Data</p>
+              <p style={{ fontSize:13,color:C.muted,marginBottom:12 }}>Clear all logged entries. Target and saved foods remain.</p>
+              <button onClick={()=>{ if(window.confirm("Clear all logged data? This cannot be undone."))setLogs({}); }}
+                style={{ ...ghostBtn, color:C.red, borderColor:C.red+"40" }}>Clear all logs</button>
+            </div>
+          </Page>
+        );
+      };
+
+      const navItems = [
+        { id:"today",    label:"Today",    icon:"○" },
+        { id:"macros",   label:"Macros",   icon:"◐" },
+        { id:"week",     label:"Week",     icon:"▦" },
+        { id:"month",    label:"Month",    icon:"▤" },
+        { id:"settings", label:"Settings", icon:"◎" },
+      ];
+
+      return (
+        <div style={{ minHeight:"100vh",background:C.bg,color:C.text,fontFamily:"'Inter',system-ui,sans-serif",maxWidth:560,margin:"0 auto",paddingBottom:80 }}>
+          <div style={{ padding:"20px 20px 0",display:"flex",justifyContent:"space-between",alignItems:"center" }}>
+            <span style={{ fontSize:17,fontWeight:700,color:C.text,letterSpacing:"-0.02em" }}>intake</span>
+            {weeklyTarget>0&&<span style={{ fontSize:12,color:C.muted,fontWeight:500 }}>{weeklyTarget.toLocaleString()} kcal / week</span>}
+          </div>
+          {view==="today"    && renderToday()}
+          {view==="macros"   && renderMacros()}
+          {view==="week"     && renderWeek()}
+          {view==="month"    && renderMonth()}
+          {view==="settings" && renderSettings()}
+          <nav style={{ position:"fixed",bottom:0,left:"50%",transform:"translateX(-50%)",width:"100%",maxWidth:560,background:C.surface,borderTop:`1px solid ${C.border}`,display:"flex",padding:"8px 0 env(safe-area-inset-bottom,8px)" }}>
+            {navItems.map(n=>(
+              <button key={n.id} onClick={()=>setView(n.id)} style={{ flex:1,background:"none",border:"none",cursor:"pointer",padding:"6px 4px",display:"flex",flexDirection:"column",alignItems:"center",gap:3,fontFamily:"inherit" }}>
+                <span style={{ fontSize:15,color:view===n.id?C.accent:C.muted,transition:"color 0.15s" }}>{n.icon}</span>
+                <span style={{ fontSize:9,fontWeight:600,letterSpacing:"0.06em",textTransform:"uppercase",color:view===n.id?C.accent:C.muted,transition:"color 0.15s" }}>{n.label}</span>
+              </button>
+            ))}
+          </nav>
+          {renderOverlay()}
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App />);
+  </script>
+</body>
+</html>
